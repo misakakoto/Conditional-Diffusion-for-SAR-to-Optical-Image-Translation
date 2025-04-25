@@ -5,82 +5,67 @@ Helpers for distributed training.
 import io
 import os
 import socket
+import torch
+import torch.distributed as dist
 
 import blobfile as bf
-import torch as th
-import torch.distributed as dist
-from mpi4py import MPI
-
-# Change this to reflect your cluster layout.
-# The GPU for a given rank is (rank % GPUS_PER_NODE).
-GPUS_PER_NODE = 8
-
-SETUP_RETRY_COUNT = 3
 
 
-def setup_dist():
+def setup_dist(local_rank=0):
     """
-    Setup a distributed process group.
+    Setup a distributed process group for multi-GPU training.
     """
     if dist.is_initialized():
         return
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
 
-    comm = MPI.COMM_WORLD
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        # 设置环境变量以初始化分布式训练
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(_find_free_port())
+        os.environ["RANK"] = str(local_rank)
+        os.environ["WORLD_SIZE"] = str(torch.cuda.device_count())
 
-    if backend == "gloo":
-        hostname = "localhost"
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
     else:
-        hostname = socket.gethostbyname(socket.getfqdn())
-    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
-    os.environ["RANK"] = str(comm.rank)
-    os.environ["WORLD_SIZE"] = str(comm.size)
+        # 单 GPU 或 CPU 模式，不初始化分布式
+        pass
 
-    port = comm.bcast(_find_free_port(), root=0)
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend=backend, init_method="env://")
+
+def setup_single():
+    """
+    Setup for single GPU or CPU training (no distributed initialization).
+    """
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def dev():
     """
-    Get the device to use for torch.distributed.
+    Get the device to use.
     """
-    if th.cuda.is_available():
-        return th.device(f"cuda")
-    return th.device("cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def load_state_dict(path, **kwargs):
     """
-    Load a PyTorch file without redundant fetches across MPI ranks.
+    Load a PyTorch file.
     """
-    chunk_size = 2 ** 30  # MPI has a relatively small size limit
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        with bf.BlobFile(path, "rb") as f:
-            data = f.read()
-        num_chunks = len(data) // chunk_size
-        if len(data) % chunk_size:
-            num_chunks += 1
-        MPI.COMM_WORLD.bcast(num_chunks)
-        for i in range(0, len(data), chunk_size):
-            MPI.COMM_WORLD.bcast(data[i : i + chunk_size])
-    else:
-        num_chunks = MPI.COMM_WORLD.bcast(None)
-        data = bytes()
-        for _ in range(num_chunks):
-            data += MPI.COMM_WORLD.bcast(None)
-
-    return th.load(io.BytesIO(data), **kwargs)
+    with bf.BlobFile(path, "rb") as f:
+        data = f.read()
+    return torch.load(io.BytesIO(data), **kwargs)
 
 
 def sync_params(params):
     """
-    Synchronize a sequence of Tensors across ranks from rank 0.
+    Synchronize a sequence of Tensors across ranks (no-op for single GPU).
     """
-    for p in params:
-        with th.no_grad():
-            dist.broadcast(p, 0)
+    if dist.is_initialized():
+        for p in params:
+            with torch.no_grad():
+                dist.broadcast(p, 0)
 
 
 def _find_free_port():
